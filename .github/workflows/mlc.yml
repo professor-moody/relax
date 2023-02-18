@@ -1,0 +1,140 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# GH actions.
+# We use it to cover windows and mac builds
+# Jenkins is still the primary CI
+
+name: CI
+
+on:
+  push:
+    branches:
+      - mlc
+  pull_request:
+    branches:
+      - mlc
+  workflow_dispatch:
+
+concurrency:
+  group: CI-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  MacOS:
+    if: ${{ github.repository == 'mlc-ai/relax' }}
+    runs-on: macOS-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: 'recursive'
+      - name: Set up environment
+        uses: ./.github/actions/setup
+      - name: Detect environment variables
+        uses: ./.github/actions/detect-env-vars
+        id: env_vars
+      - name: Build TIRx and TVM wheels
+        shell: bash -l {0}
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.env_vars.outputs.cpu_count }}
+        run: |
+          set -euxo pipefail
+          pip install "scikit-build-core>=0.11" "setuptools-scm>=8"
+          export CMAKE_ARGS="-DTVM_TIRX_USE_LLVM=ON -DTVM_TIRX_USE_METAL=ON -DTVM_TIRX_BUILD_TESTS=OFF"
+          pip wheel --no-deps -w dist ./3rdparty/tvm-tirx -v
+          pip install --no-deps --force-reinstall dist/apache_tvm_tirx-*.whl
+          export CMAKE_ARGS="-DBUILD_TESTING=OFF"
+          pip wheel --no-deps --no-build-isolation -w dist . -v
+      - name: Install TIRx and TVM from wheels
+        shell: bash -l {0}
+        run: |
+          set -euxo pipefail
+          pip install ml_dtypes
+          # --no-deps: this package requires apache-tvm-ffi>=0.1.14.post1, and the source-built core
+          # versions as 0.1.dev1+g<sha> from the shallow checkout, which is < 0.1.0 under PEP 440.
+          # Without it pip replaces the source-matched core with a PyPI build.
+          pip install --no-deps apache-tvm-ffi-orcjit==0.1.2
+          # Keep the source-matched tvm-ffi installed by the setup action.
+          pip install --no-deps dist/*.whl
+
+      - name: Build iOS RPC
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          IOS_VERSION="14.0"
+          CMAKE_FLAGS="-DCMAKE_BUILD_TYPE=Release \
+                       -DCMAKE_SYSTEM_NAME=iOS \
+                       -DCMAKE_SYSTEM_VERSION=${IOS_VERSION} \
+                       -DCMAKE_OSX_SYSROOT=iphonesimulator \
+                       -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+                       -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+                       -DCMAKE_BUILD_WITH_INSTALL_NAME_DIR=ON \
+                       -DTVM_USE_IOS_RPC=ON \
+                       -DTVM_USE_INSTALLED_TIRX=OFF \
+                       -DTVM_TIRX_USE_LLVM=OFF \
+                       -DTVM_TIRX_USE_Z3=OFF \
+                       -DTVM_TIRX_USE_CUDA=OFF \
+                       -DTVM_FFI_USE_LIBBACKTRACE=OFF"
+
+          mkdir build-ios-simulator
+          cd build-ios-simulator
+          cmake .. ${CMAKE_FLAGS}
+          cmake --build . --target ios_rpc
+      - name: Test
+        shell: bash -l {0}
+        run: >-
+          python -m pytest -v 3rdparty/tvm-tirx/tests/python/codegen/llvm/test_minimal.py
+
+  Windows:
+    if: ${{ github.repository == 'mlc-ai/relax' }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: 'recursive'
+      - name: Set up environment
+        uses: ./.github/actions/setup
+      - name: Detect environment variables
+        uses: ./.github/actions/detect-env-vars
+        id: env_vars
+      - name: Build and install TIRx and TVM
+        shell: cmd /C call {0}
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: ${{ steps.env_vars.outputs.cpu_count }}
+        run: |
+          pip install "scikit-build-core>=0.11" "setuptools-scm>=8" || exit /b 1
+          set CMAKE_ARGS=-DTVM_TIRX_USE_LLVM=ON -DTVM_TIRX_BUILD_TESTS=OFF
+          pip wheel --no-deps -w dist ./3rdparty/tvm-tirx -v || exit /b 1
+          for %%w in (dist\apache_tvm_tirx-*.whl) do (
+            pip install --no-deps --force-reinstall "%%w" || exit /b 1
+          )
+          set CMAKE_ARGS=-DBUILD_TESTING=OFF
+          pip wheel --no-deps --no-build-isolation -w dist . -v || exit /b 1
+          for %%w in (dist\*.whl) do (
+            pip install --no-deps "%%w" || exit /b 1
+          )
+      - name: Install test dependencies
+        shell: cmd /C call {0}
+        run: |
+          pip install psutil cloudpickle ml_dtypes numpy packaging scipy tornado typing_extensions || exit /b 1
+          rem --no-deps keeps the source-built apache-tvm-ffi (versioned below 0.1.14.post1 from the
+          rem shallow checkout) from being replaced by a PyPI build.
+          pip install --no-deps apache-tvm-ffi-orcjit==0.1.2
+      - name: Test
+        shell: cmd /C call {0}
+        run: >-
+          python -m pytest -v 3rdparty/tvm-tirx/tests/python/codegen/llvm/test_minimal.py
